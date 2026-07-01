@@ -1,5 +1,47 @@
 import streamlit as st
 import datetime
+import math
+import pytz
+from geopy.geocoders import Nominatim
+from timezonefinder import TimezoneFinder
+from datetime import datetime, timedelta
+
+# ---------------------------------------------------------
+# 升级：NOAA (美国国家海洋和大气管理局) 高精度太阳均时差算法
+# ---------------------------------------------------------
+def get_equation_of_time(dt):
+    # 提取一年中的第几天 (0-365)
+    d = dt.timetuple().tm_yday - 1 
+    # 换算当前时间为小数
+    h = dt.hour + dt.minute / 60.0 + dt.second / 3600.0
+    
+    # γ (Gamma): 将当前时间映射到 2π 周期内的弧度 (精准包含闰年周期 365.24)
+    gamma = (2 * math.pi / 365.24) * (d + (h - 12) / 24.0)
+    
+    # 高精度傅里叶级数展开 (天文级精度，误差缩小至极少数秒内)
+    eot = 229.18 * (
+        0.000075 
+        + 0.001868 * math.cos(gamma) 
+        - 0.032077 * math.sin(gamma) 
+        - 0.014615 * math.cos(2 * gamma) 
+        - 0.040849 * math.sin(2 * gamma)
+    )
+    return eot
+
+# ==========================================
+# 全球城市时空数据库 (经度, 时区, 时区标准子午线)
+# ==========================================
+CITY_DB = {
+    "北京": {"lon": 116.40, "tz": "Asia/Shanghai", "meridian": 120.0},
+    "哈尔滨": {"lon": 126.63, "tz": "Asia/Shanghai", "meridian": 120.0},
+    "深圳": {"lon": 114.05, "tz": "Asia/Shanghai", "meridian": 120.0},
+    "成都": {"lon": 104.06, "tz": "Asia/Shanghai", "meridian": 120.0},
+    "纽约": {"lon": -74.00, "tz": "America/New_York", "meridian": -75.0},
+    "洛杉矶": {"lon": -118.24, "tz": "America/Los_Angeles", "meridian": -120.0},
+    "伦敦": {"lon": -0.12, "tz": "Europe/London", "meridian": 0.0},
+    "东京": {"lon": 139.69, "tz": "Asia/Tokyo", "meridian": 135.0},
+    "悉尼": {"lon": 151.20, "tz": "Australia/Sydney", "meridian": 150.0}
+}
 import random
 # ==========================================
 # 跨文件模块导入 (工程化核心)
@@ -38,18 +80,106 @@ st.title("🧿 赛博玄学 V33.0 (模块化架构版)")
 if 'yao_list' not in st.session_state: st.session_state['yao_list'] = []
 if 'u_info' not in st.session_state: st.session_state['u_info'] = {}
 
+# ---------------------------------------------------------
+# 新增：带内存缓存的地理编码器（只要查询词不变，瞬间返回结果）
+# ---------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def get_cached_location(query):
+    geolocator = Nominatim(user_agent="cyber_metaphysics_v33")
+    try:
+        loc = geolocator.geocode(query)
+        if loc:
+            return {
+                "lon": loc.longitude, 
+                "lat": loc.latitude, 
+                "city_name": loc.address.split(',')[0],
+                "address": loc.address
+            }
+    except Exception:
+        return None
+    return None
+
 with st.sidebar:
     st.header("🔮 本地定场录入")
+    
+    # 增加了一个智能搜索模式
+    loc_mode = st.radio("定位模式", ["📍 快速选城", "🔍 智能搜索 (全自动)", "🎯 精确坐标 (手动)"], horizontal=False)
+    
+    # 初始化默认值
+    city_name = "未知坐标"
+    lon = 126.63
+    lat = 45.75
+    
+    if loc_mode == "📍 快速选城":
+        CITY_DB = {
+            "北京": {"lon": 116.40, "lat": 39.90},
+            "哈尔滨": {"lon": 126.63, "lat": 45.75},
+            "深圳": {"lon": 114.05, "lat": 22.52},
+            "成都": {"lon": 104.06, "lat": 30.67},
+        }
+        selected_city = st.selectbox("选择城市", list(CITY_DB.keys()))
+        city_name = selected_city
+        lon = CITY_DB[selected_city]["lon"]
+        lat = CITY_DB[selected_city]["lat"]
+        
+    elif loc_mode == "🔍 智能搜索 (全自动)":
+        search_query = st.text_input("🌍 输入地名 (如: 漠河 / 纽约曼哈顿)", value="哈尔滨")
+        if search_query:
+            with st.spinner('📡 正在读取时空坐标...'):
+                # 调用缓存函数，避免重复请求
+                loc_data = get_cached_location(search_query)
+            
+            if loc_data:
+                lon = loc_data["lon"]
+                lat = loc_data["lat"]
+                city_name = loc_data["city_name"]
+                st.success(f"锁定坐标: {city_name} (经度 {lon:.4f})")
+                st.caption(f"完整地址: {loc_data['address']}")
+            else:
+                st.error("❌ 未能解析该地点，请尝试输入更大的行政区划。")
+            
+                
+    else:
+        st.caption("请查阅手机指南针或地图软件")
+        lon = st.number_input("经度 (Longitude)", value=126.6300, format="%.4f")
+        lat = st.number_input("纬度 (Latitude)", value=45.7500, format="%.4f")
+        city_name = f"手动经度:{lon:.2f}"
+
+    # ==========================================
+    # 以下是不变的时区计算和 Form 提交逻辑
+    # ==========================================
+    tf = TimezoneFinder()
+    tz_name = tf.timezone_at(lng=lon, lat=lat) 
+    
+    if tz_name:
+        tz = pytz.timezone(tz_name)
+        local_now = datetime.now(tz)
+        utc_offset_hours = local_now.utcoffset().total_seconds() / 3600
+        meridian = utc_offset_hours * 15.0
+    else:
+        tz = pytz.timezone("UTC")
+        local_now = datetime.utcnow()
+        meridian = 0.0
+        st.warning("⚠️ 坐标处于无人区或海洋，已回退至 UTC 零时区。")
+
     with st.form("entry_form"):
-        u_date = st.date_input("🗓️ 日期", datetime.date.today())
-        u_time = st.time_input("⏰ 时间", datetime.datetime.now().time())
-        city = st.text_input("📍 城市", value="哈尔滨")
+        u_date = st.date_input("🗓️ 日期", local_now.date())
+        u_time = st.time_input("⏰ 时间", local_now.time())
         name = st.text_input("👤 求测人")
         ask = st.text_input("🖊️ 问事")
+        
         if st.form_submit_button("🔵 锁定本地时空", type="primary") and name and ask:
-            st.session_state['u_info'] = {"city": city, "name": name, "ask": ask, "dt": datetime.datetime.combine(u_date, u_time)}
+            st.session_state['u_info'] = {
+                "city": city_name, 
+                "name": name, 
+                "ask": ask, 
+                "dt": datetime.combine(u_date, u_time),
+                "lon": lon,
+                "meridian": meridian
+            }
             st.session_state['yao_list'] = []
             st.rerun()
+
 
 if not st.session_state['u_info']:
     st.info("👈 请在侧边栏手动设定时空锚点开启排盘。")
@@ -75,13 +205,25 @@ else:
     else:
         st.success("时空锁定，四大引擎并发解算完成。")
         
-        # 1. 初始化参数
-        lon = 116.40
-        for k, v in {"北京": 116.40, "哈尔滨": 126.63, "深圳": 114.05, "成都": 104.06}.items():
-            if k in info['city']: lon = v
-        m_diff = (lon - 120.0) * 4 
-        t_solar = info['dt'] + datetime.timedelta(minutes=m_diff)
+        # ==========================================
+        # 1. 初始化时空参数 (经度修正 + 天文均时差修正)
+        # ==========================================
+        lon = info.get('lon', 120.0)
+        meridian = info.get('meridian', 120.0)
         
+        # A. 经度带来的平太阳差值 (分钟)
+        m_diff = (lon - meridian) * 4 
+        
+        # B. 地球公转轨道带来的均时差 (分钟)
+        eot_diff = get_equation_of_time(info['dt'])
+        
+        # C. 终极推导：真太阳时 = 钟表时间 + 经度差 + 均时差
+        total_minutes_diff = m_diff + eot_diff
+        t_solar = info['dt'] + timedelta(minutes=total_minutes_diff)
+        
+        # se = PrecisionSolarEngine() ... (后面接原代码)
+        
+               
         # 2. 调用核心引擎 (core_engine.py)
         se = PrecisionSolarEngine()
         slong, term, dun_type, ju_map, yue_jiang = se.get_solar_data(t_solar)
@@ -114,7 +256,7 @@ else:
         """, unsafe_allow_html=True)
         
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("真太阳时", t_solar.strftime('%m-%d %H:%M'), "早子时" if p['is_early_zi'] else None)
+        c1.metric("真太阳时", t_solar.strftime('%m-%d %H:%M:%S'), "早子时" if p['is_early_zi'] else None)
         c2.metric("四柱", f"{p['year']} {p['month']} {p['day']} {p['hour']}")
         c3.metric("奇门定局", f"{term} {dun_type}{ju}局", p['kw']+"空")
         c4.metric("六壬月将", f"{yue_jiang}将", f"日干寄宫:{p['day_gan']}->{r_data['ji_gong']}")
